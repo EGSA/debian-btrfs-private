@@ -1,0 +1,232 @@
+version: 2.1
+
+parameters:
+  debian_release:
+    type: string
+    default: "trixie"
+
+jobs:
+  build-and-upload:
+    machine:
+      image: ubuntu-2204:current
+      resource_class: large
+    parameters:
+      debian_release:
+        type: string
+    steps:
+      - checkout
+
+      - run:
+          name: 安装基础工具（非交互）
+          command: |
+            set -euo pipefail
+            sudo tee /usr/sbin/policy-rc.d > /dev/null \<<'EOF'
+            #!/bin/sh
+            exit 101
+            EOF
+            sudo chmod +x /usr/sbin/policy-rc.d
+            export DEBIAN_FRONTEND=noninteractive
+            export APT_LISTCHANGES_FRONTEND=none
+            sudo apt update
+            sudo apt install -y debootstrap btrfs-progs qemu-utils qemu-user-static libguestfs-tools axel wget curl util-linux rsync gdisk grub-pc-bin kpartx
+
+      - run:
+          name: debootstrap -> chroot 安装
+          command: |
+            set -euo pipefail
+            RELEASE=<< parameters.debian_release >>
+            DEBOOT_DIR=/tmp/debootstrap-root
+            sudo rm -rf "$DEBOOT_DIR"
+            sudo mkdir -p "$DEBOOT_DIR"
+            sudo debootstrap --arch=amd64 --variant=minbase "$RELEASE" "$DEBOOT_DIR" http://deb.debian.org/debian
+            sudo cp /etc/resolv.conf "$DEBOOT_DIR/etc/resolv.conf"
+            for fs in proc sys dev; do sudo mount --bind "/$fs" "$DEBOOT_DIR/$fs"; done
+            sudo tee "$DEBOOT_DIR/usr/sbin/policy-rc.d" > /dev/null \<<'EOF'
+            #!/bin/sh
+            exit 101
+            EOF
+            sudo chmod +x "$DEBOOT_DIR/usr/sbin/policy-rc.d"
+            sudo chroot "$DEBOOT_DIR" /bin/bash -c "\
+              export DEBIAN_FRONTEND=noninteractive; \
+              export APT_LISTCHANGES_FRONTEND=none; \
+              apt-get update && \
+              apt-get -y -o DPkg::Options::='--force-confdef' -o DPkg::Options::='--force-confold' \
+                install cloud-init openssh-server locales tzdata linux-image-cloud-amd64 initramfs-tools grub-pc-bin grub-pc wget htop curl iproute2 net-tools ifupdown isc-dhcp-client python3-requests && \
+              apt-get -y autoremove && apt-get -y clean \
+            "
+            sudo chroot "$DEBOOT_DIR" /bin/bash -c "ln -sf /usr/share/zoneinfo/Asia/Hong_Kong /etc/localtime && dpkg-reconfigure -f noninteractive tzdata"
+            sudo chroot "$DEBOOT_DIR" /bin/bash -c "rm -rf /usr/share/doc/* /usr/share/locale/* /var/cache/apt/* /var/lib/apt/lists/*"
+            sudo chroot "$DEBOOT_DIR" /bin/bash -c "mkdir -p /etc/cloud && echo 'preserve_hostname: false' > /etc/cloud/cloud.cfg.d/99_custom.cfg"
+            for fs in dev sys proc; do sudo umount "$DEBOOT_DIR/$fs" || true; done
+
+      - run:
+          name: 创建带分区表的 btrfs 镜像
+          command: |
+            set -euo pipefail
+            RELEASE=${RELEASE:-<< parameters.debian_release >>}
+            IMG_SIZE=1G
+            IMG_FILE="debian-${RELEASE}-btrfs.img"
+            sudo rm -f "$IMG_FILE"
+            sudo fallocate -l "$IMG_SIZE" "$IMG_FILE"
+
+            echo ",,83" | sudo sfdisk --label dos "$IMG_FILE"
+
+            LOOP_DEV=$(sudo losetup --show -fP "$IMG_FILE")
+            sleep 1
+
+            if [ -b "${LOOP_DEV}p1" ]; then
+              PART_DEV="${LOOP_DEV}p1"
+            else
+              KOUT=$(sudo kpartx -av "$LOOP_DEV" 2>/dev/null || true)
+              PART_DEV=$(echo "$KOUT" | awk '{print "/dev/mapper/" $3; exit}' || true)
+            fi
+
+            if [ -z "${PART_DEV:-}" ] || [ ! -b "$PART_DEV" ]; then
+              echo "未能映射到分区设备，清理并退出" >&2
+              sudo losetup -d "$LOOP_DEV" || true
+              exit 1
+            fi
+
+            sudo mkfs.btrfs -f -M -L "debian_${RELEASE}_btrfs" "$PART_DEV"
+
+            MOUNT_DIR=/mnt/debian-root
+            sudo mkdir -p "$MOUNT_DIR"
+            sudo mount -o loop,compress=zstd:9,noatime "$PART_DEV" "$MOUNT_DIR"
+            sudo btrfs subvolume create "$MOUNT_DIR/@" || true
+            sudo umount "$MOUNT_DIR"
+
+            if command -v kpartx >/dev/null 2>&1; then sudo kpartx -dv "$LOOP_DEV" || true; fi
+            sudo losetup -d "$LOOP_DEV" || true
+
+      - run:
+          name: 复制文件、清理并移除 chroot policy-rc.d 到分区上的 @ 子卷
+          command: |
+            set -euo pipefail
+            RELEASE=${RELEASE:-<< parameters.debian_release >>}
+            DEBOOT_DIR=/tmp/debootstrap-root
+            IMG_FILE="debian-${RELEASE}-btrfs.img"
+            MOUNT_DIR=/mnt/debian-root
+            sudo mkdir -p "$MOUNT_DIR"
+
+            LOOP_DEV=$(sudo losetup --show -fP "$IMG_FILE")
+            sleep 1
+            if [ -b "${LOOP_DEV}p1" ]; then
+              PART_DEV="${LOOP_DEV}p1"
+            else
+              KOUT=$(sudo kpartx -av "$LOOP_DEV" 2>/dev/null || true)
+              PART_DEV=$(echo "$KOUT" | awk '{print "/dev/mapper/" $3; exit}' || true)
+            fi
+            if [ -z "${PART_DEV:-}" ] || [ ! -b "$PART_DEV" ]; then
+              echo "未找到分区设备，退出" >&2
+              sudo losetup -d "$LOOP_DEV" || true
+              exit 1
+            fi
+
+            sudo mount -o subvol=@,compress-force=zstd:9,discard=async,noatime "$PART_DEV" "$MOUNT_DIR"
+            sudo rsync -aHAX --numeric-ids --sparse --delete "$DEBOOT_DIR"/ "$MOUNT_DIR"/
+            sudo truncate -s 0 "$MOUNT_DIR/etc/machine-id" || true
+            echo "datasource_list: [ AliYun, ConfigDrive, None ]" | sudo tee "$MOUNT_DIR/etc/cloud/cloud.cfg.d/90-network-config.cfg" > /dev/null
+            sudo chroot "$MOUNT_DIR" /bin/bash -c "cloud-init clean --logs --seed" || true
+            NEW_UUID=$(sudo blkid -s UUID -o value "$PART_DEV")
+            sudo mkdir -p "$MOUNT_DIR/etc"
+            echo "UUID=$NEW_UUID / btrfs subvol=@,compress-force=zstd:9,defaults,discard=async 0 0" | sudo tee "$MOUNT_DIR/etc/fstab" > /dev/null
+            sudo cat "$MOUNT_DIR/etc/fstab"
+            sudo rm -rf "$MOUNT_DIR/var/log/"* "$MOUNT_DIR/var/cache/"* "$MOUNT_DIR/tmp/"* || true
+            sudo rm -f "$MOUNT_DIR/usr/sbin/policy-rc.d" || true
+            sudo umount "$MOUNT_DIR"
+
+      - run:
+          name: 在环回设备上为镜像安装 GRUB BIOS（尝试，失败则报错）
+          command: |
+            set -euo pipefail
+            RELEASE=${RELEASE:-<< parameters.debian_release >>}
+            IMG_FILE="debian-${RELEASE}-btrfs.img"
+            MOUNT_DIR=/mnt/debian-boot-attach
+            sudo mkdir -p "$MOUNT_DIR"
+
+            LOOP_DEV=$(sudo losetup --show -fP "$IMG_FILE")
+            sleep 1
+            if [ -b "${LOOP_DEV}p1" ]; then
+              PART_DEV="${LOOP_DEV}p1"
+            else
+              KOUT=$(sudo kpartx -av "$LOOP_DEV" 2>/dev/null || true)
+              PART_DEV=$(echo "$KOUT" | awk '{print "/dev/mapper/" $3; exit}' || true)
+            fi
+
+            if [ -z "${PART_DEV:-}" ] || [ ! -b "$PART_DEV" ]; then
+              echo "未找到分区设备，无法安装 GRUB" >&2
+              sudo losetup -d "$LOOP_DEV" || true
+              exit 1
+            fi
+
+            sudo mount -o subvol=@,compress-force=zstd:9,discard=async,noatime "$PART_DEV" "$MOUNT_DIR"
+            for fs in proc sys dev run; do sudo mount --bind "/$fs" "$MOUNT_DIR/$fs"; done
+            sudo cp /etc/resolv.conf "$MOUNT_DIR/etc/resolv.conf" || true
+            sudo mkdir -p "$MOUNT_DIR/boot"
+
+            if sudo chroot "$MOUNT_DIR" /bin/bash -c "command -v grub-install >/dev/null 2>&1"; then
+              sudo chroot "$MOUNT_DIR" /bin/bash -c "grub-install --target=i386-pc --recheck --boot-directory=/boot $LOOP_DEV"
+              sudo chroot "$MOUNT_DIR" /bin/bash -c "update-grub || true"
+            else
+              echo "chroot 中未检测到 grub-install，安装可能失败" >&2
+              for fs in run dev sys proc; do sudo umount "$MOUNT_DIR/$fs" || true; done
+              sudo umount "$MOUNT_DIR" || true
+              sudo losetup -d "$LOOP_DEV" || true
+              exit 1
+            fi
+
+            for fs in run dev sys proc; do sudo umount "$MOUNT_DIR/$fs" || true; done
+            sudo umount "$MOUNT_DIR" || true
+            if command -v kpartx >/dev/null 2>&1; then sudo kpartx -dv "$LOOP_DEV" || true; fi
+            sudo losetup -d "$LOOP_DEV" || true
+            sudo rmdir "$MOUNT_DIR" || true
+
+      - run:
+          name: 转换为 qcow2 并根据 qcow2 的 sha1 生成最终文件名
+          command: |
+            set -euo pipefail
+            RELEASE=${RELEASE:-<< parameters.debian_release >>}
+            IMG_FILE="debian-${RELEASE}-btrfs.img"
+            QCOW2_TMP="debian-${RELEASE}-btrfs.tmp.qcow2"
+            qemu-img convert -p -O qcow2 -c "$IMG_FILE" "$QCOW2_TMP"
+            SHA1=$(sha1sum "$QCOW2_TMP" | awk '{print $1}')
+            QCOW2_FINAL="debian-${RELEASE}-btrfs-${SHA1}.qcow2"
+            mv -f "$QCOW2_TMP" "$QCOW2_FINAL"
+            ls -lh "$QCOW2_FINAL"
+
+      - run:
+          name: 安装 gh 并上传到 GitHub Release
+          command: |
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            export APT_LISTCHANGES_FRONTEND=none
+            type -p curl >/dev/null || sudo apt install -y curl
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
+              sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+              sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
+              sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+              sudo apt update && sudo apt install -y gh
+            RELEASE=<< parameters.debian_release >>
+            export GITHUB_TOKEN=$GH_TOKEN
+            TAG_NAME="${CIRCLE_TAG:-manual-$(date +%s)}"
+            SHA1=$(sha1sum "debian-${RELEASE}-btrfs-"*".qcow2" | awk '{print $1}' | head -n1)
+            FNAME="debian-${RELEASE}-btrfs-${SHA1}.qcow2"
+            ls -lh "$FNAME" || (echo "镜像文件不存在: $FNAME" && exit 1)
+            if ! gh release view "$TAG_NAME" > /dev/null 2>&1; then
+              gh release create "$TAG_NAME" --title "Debian Btrfs Cloud Image $TAG_NAME" --notes "自动发布自定义 Debian ${RELEASE} Btrfs 压缩镜像"
+            fi
+            gh release upload "$TAG_NAME" "$FNAME" --clobber
+            gh release upload latest "$FNAME" --clobber || echo "latest 不存在，跳过上传"
+            sudo rm -f /usr/sbin/policy-rc.d || true
+
+workflows:
+  build_and_release:
+    jobs:
+      - build-and-upload:
+          debian_release: << pipeline.parameters.debian_release >>
+          filters:
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/
