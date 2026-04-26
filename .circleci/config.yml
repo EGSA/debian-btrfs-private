@@ -4,20 +4,27 @@ parameters:
   debian_release:
     type: string
     default: "trixie"
+  boot_mode:
+    type: enum
+    enum: ["bios", "bios-uefi"]
+    default: "bios"
 
 jobs:
-  debian-btrfs-bios-build:
+  build-debian-btrfs-image:
     machine:
       image: ubuntu-2204:current
       resource_class: medium
     parameters:
       debian_release:
         type: string
+      boot_mode:
+        type: enum
+        enum: ["bios", "bios-uefi"]
     steps:
       - checkout
 
       - run:
-          name: 安装基础工具（非交互）
+          name: 安装基础工具
           command: |
             set -euo pipefail
             sudo tee /usr/sbin/policy-rc.d > /dev/null \<<'EOF'
@@ -25,16 +32,16 @@ jobs:
             exit 101
             EOF
             sudo chmod +x /usr/sbin/policy-rc.d
-            export DEBIAN_FRONTEND=noninteractive
-            export APT_LISTCHANGES_FRONTEND=none
+            export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
             sudo apt update
             sudo apt install -y debootstrap btrfs-progs qemu-utils qemu-user-static libguestfs-tools axel wget curl util-linux rsync gdisk grub-pc-bin kpartx
 
       - run:
-          name: debootstrap -> chroot 安装
+          name: debootstrap -> chroot 系统配置
           command: |
             set -euo pipefail
             RELEASE=<< parameters.debian_release >>
+            BOOT_MODE=<< parameters.boot_mode >>
             DEBOOT_DIR=/tmp/debootstrap-root
             sudo rm -rf "$DEBOOT_DIR"
             sudo mkdir -p "$DEBOOT_DIR"
@@ -46,348 +53,137 @@ jobs:
             exit 101
             EOF
             sudo chmod +x "$DEBOOT_DIR/usr/sbin/policy-rc.d"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "\
-              export DEBIAN_FRONTEND=noninteractive; \
-              export APT_LISTCHANGES_FRONTEND=none; \
-              apt-get update && \
-              apt-get -y -o DPkg::Options::='--force-confdef' -o DPkg::Options::='--force-confold' \
-                install cloud-init openssh-server locales tzdata linux-image-cloud-amd64 initramfs-tools grub-pc-bin grub-pc btrfs-progs btrfs-compsize haveged unattended-upgrades dbus \
-                wget htop curl iproute2 net-tools ifupdown isc-dhcp-client python3-requests ca-certificates dialog perl-modules && \
-              sed -i '/en_US.UTF-8 UTF-8/s/^# //g' /etc/locale.gen && locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && \
-              apt-get -y autoremove && apt-get -y clean \
-            "
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "ln -sf /usr/share/zoneinfo/Asia/Hong_Kong /etc/localtime && dpkg-reconfigure -f noninteractive tzdata"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "echo 'APT::Periodic::Update-Package-Lists \"1\";' > /etc/apt/apt.conf.d/20auto-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "echo 'APT::Periodic::Unattended-Upgrade \"1\";' >> /etc/apt/apt.conf.d/20auto-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "sed -i 's/.*Unattended-Upgrade::Remove-Unused-Dependencies.*/Unattended-Upgrade::Remove-Unused-Dependencies \"true\";/' /etc/apt/apt.conf.d/50unattended-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "sed -i 's/.*Unattended-Upgrade::Remove-Unused-Kernel-Packages.*/Unattended-Upgrade::Remove-Unused-Kernel-Packages \"true\";/' /etc/apt/apt.conf.d/50unattended-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "echo 'Unattended-Upgrade::Post-Invoke-Purge \"true\";' >> /etc/apt/apt.conf.d/50unattended-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "passwd -d root && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "rm -rf /usr/share/doc/* /var/cache/apt/* /var/lib/apt/lists/*"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "find /usr/share/locale/ -mindepth 1 -maxdepth 1 ! -name 'en*' -exec rm -rf {} +"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "cat /etc/passwd && cat /etc/shadow"
-            sudo chroot "$DEBOOT_DIR" rm -f /etc/ssh/ssh_host_*
-            sudo rm -f "$DEBOOT_DIR/var/lib/dbus/machine-id"
+
+            # 根据 boot_mode 生成包列表
+            if [ "$BOOT_MODE" = "bios-uefi" ]; then
+              GRUB_PKGS="grub-efi-amd64 grub-efi-amd64-bin grub-pc-bin efibootmgr dosfstools"
+              EXTRA_PKGS=""
+            else
+              GRUB_PKGS="grub-pc grub-pc-bin"
+              EXTRA_PKGS=""
+            fi
+
+            # 将包列表作为环境变量传入 chroot
+            sudo chroot "$DEBOOT_DIR" /bin/bash -c "export GRUB_PKGS='$GRUB_PKGS'; export EXTRA_PKGS='$EXTRA_PKGS'; $(cat \<<'CHROOT_SCRIPT'
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
+            
+            apt-get update
+            apt-get -y -o DPkg::Options::='--force-confdef' -o DPkg::Options::='--force-confold' install \
+              cloud-init openssh-server locales tzdata linux-image-cloud-amd64 initramfs-tools \
+              btrfs-progs btrfs-compsize haveged unattended-upgrades dbus \
+              wget htop curl iproute2 net-tools ifupdown isc-dhcp-client python3-requests ca-certificates dialog perl-modules \
+              $GRUB_PKGS $EXTRA_PKGS
+
+            # 配置时区
+            ln -sf /usr/share/zoneinfo/Asia/Hong_Kong /etc/localtime
+            dpkg-reconfigure -f noninteractive tzdata
+
+            # 配置 locale
+            sed -i '/en_US.UTF-8 UTF-8/s/^# //g' /etc/locale.gen
+            locale-gen en_US.UTF-8
+            update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+            # 配置自动更新
+            cat > /etc/apt/apt.conf.d/20auto-upgrades \<<'APT_EOF'
+            APT::Periodic::Update-Package-Lists "1";
+            APT::Periodic::Unattended-Upgrade "1";
+            APT_EOF
+
+            sed -i 's/.*Unattended-Upgrade::Remove-Unused-Dependencies.*/Unattended-Upgrade::Remove-Unused-Dependencies "true";/' /etc/apt/apt.conf.d/50unattended-upgrades
+            sed -i 's/.*Unattended-Upgrade::Remove-Unused-Kernel-Packages.*/Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";/' /etc/apt/apt.conf.d/50unattended-upgrades
+            echo 'Unattended-Upgrade::Post-Invoke-Purge "true";' >> /etc/apt/apt.conf.d/50unattended-upgrades
+
+            # 配置 SSH
+            sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+            passwd -d root
+            sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+
+            # 清理和本地化
+            rm -rf /usr/share/doc/* /var/cache/apt/* /var/lib/apt/lists/*
+            find /usr/share/locale/ -mindepth 1 -maxdepth 1 ! -name 'en*' -exec rm -rf {} +
+            cat /etc/passwd && cat /etc/shadow
+            rm -f /etc/ssh/ssh_host_*
+            apt-get -y autoremove && apt-get -y clean
+            CHROOT_SCRIPT
+            )"
+
             for fs in dev sys proc; do sudo umount "$DEBOOT_DIR/$fs" || true; done
 
       - run:
-          name: 创建带分区表的 btrfs 镜像
+          name: 创建分区镜像（条件化：MBR 或 GPT）
           command: |
             set -euo pipefail
             RELEASE=${RELEASE:-<< parameters.debian_release >>}
+            BOOT_MODE=<< parameters.boot_mode >>
             IMG_SIZE=1G
             IMG_FILE="debian-${RELEASE}-btrfs.img"
             sudo rm -f "$IMG_FILE"
             sudo fallocate -l "$IMG_SIZE" "$IMG_FILE"
 
-            echo ",,83" | sudo sfdisk --label dos "$IMG_FILE"
+            if [ "$BOOT_MODE" = "bios-uefi" ]; then
+              PART_COUNT=3
+              sudo parted --script "$IMG_FILE" \
+                mklabel gpt \
+                mkpart primary 1MiB 2MiB \
+                name 1 bios_grub \
+                set 1 bios_grub on \
+                mkpart ESP fat32 2MiB 35MiB \
+                set 2 boot on \
+                name 2 efi \
+                mkpart primary 35MiB 100% \
+                name 3 root
+            else
+              PART_COUNT=1
+              echo ",,83" | sudo sfdisk --label dos "$IMG_FILE"
+            fi
 
             LOOP_DEV=$(sudo losetup --show -fP "$IMG_FILE")
             sleep 1
 
-            if [ -b "${LOOP_DEV}p1" ]; then
-              PART_DEV="${LOOP_DEV}p1"
-            else
-              KOUT=$(sudo kpartx -av "$LOOP_DEV" 2>/dev/null || true)
-              PART_DEV=$(echo "$KOUT" | awk '{print "/dev/mapper/" $3; exit}' || true)
-            fi
-
-            if [ -z "${PART_DEV:-}" ] || [ ! -b "$PART_DEV" ]; then
-              echo "未能映射到分区设备，清理并退出" >&2
-              sudo losetup -d "$LOOP_DEV" || true
-              exit 1
-            fi
-
-            sudo mkfs.btrfs -f -M -L "debian_${RELEASE}_btrfs" "$PART_DEV"
-
-            MOUNT_DIR=/mnt/debian-root
-            sudo mkdir -p "$MOUNT_DIR"
-            sudo mount -o loop,compress=zstd:9,noatime "$PART_DEV" "$MOUNT_DIR"
-            sudo btrfs subvolume create "$MOUNT_DIR/@" || true
-            sudo umount "$MOUNT_DIR"
-
-            if command -v kpartx >/dev/null 2>&1; then sudo kpartx -dv "$LOOP_DEV" || true; fi
-            sudo losetup -d "$LOOP_DEV" || true
-
-      - run:
-          name: 复制文件、清理并移除 chroot policy-rc.d 到分区上的 @ 子卷
-          command: |
-            set -euo pipefail
-            RELEASE=${RELEASE:-<< parameters.debian_release >>}
-            DEBOOT_DIR=/tmp/debootstrap-root
-            IMG_FILE="debian-${RELEASE}-btrfs.img"
-            MOUNT_DIR=/mnt/debian-root
-            sudo mkdir -p "$MOUNT_DIR"
-
-            LOOP_DEV=$(sudo losetup --show -fP "$IMG_FILE")
-            sleep 1
-            if [ -b "${LOOP_DEV}p1" ]; then
-              PART_DEV="${LOOP_DEV}p1"
-            else
-              KOUT=$(sudo kpartx -av "$LOOP_DEV" 2>/dev/null || true)
-              PART_DEV=$(echo "$KOUT" | awk '{print "/dev/mapper/" $3; exit}' || true)
-            fi
-            if [ -z "${PART_DEV:-}" ] || [ ! -b "$PART_DEV" ]; then
-              echo "未找到分区设备，退出" >&2
-              sudo losetup -d "$LOOP_DEV" || true
-              exit 1
-            fi
-
-            sudo mount -o subvol=@,compress-force=zstd:9,discard=async,noatime "$PART_DEV" "$MOUNT_DIR"
-            sudo rsync -aHAX --numeric-ids --sparse --delete "$DEBOOT_DIR"/ "$MOUNT_DIR"/
-            sudo truncate -s 0 "$MOUNT_DIR/etc/machine-id" || true
-            cat \<<EOF | sudo tee "$MOUNT_DIR/etc/cloud/cloud.cfg.d/99-custom.cfg" > /dev/null
-            datasource_list: [ AliYun, ConfigDrive, None ]
-            manage_etc_hosts: true
-            disable_root: false
-            preserve_hostname: false
-            system_info:
-              default_user:
-                name: root
-              network:
-                renderers: ['eni']
-            EOF
-            sudo chroot "$MOUNT_DIR" /bin/bash -c "cloud-init clean --logs --seed" || true
-            NEW_UUID=$(sudo blkid -s UUID -o value "$PART_DEV")
-            sudo mkdir -p "$MOUNT_DIR/etc"
-            echo "UUID=$NEW_UUID / btrfs subvol=@,compress-force=zstd:9,defaults,discard=async 0 0" | sudo tee "$MOUNT_DIR/etc/fstab" > /dev/null
-            sudo cat "$MOUNT_DIR/etc/fstab"
-            sudo rm -rf "$MOUNT_DIR/var/log/"* "$MOUNT_DIR/var/cache/"* "$MOUNT_DIR/tmp/"* || true
-            sudo rm -f "$MOUNT_DIR/usr/sbin/policy-rc.d" || true
-            sudo umount "$MOUNT_DIR"
-
-      - run:
-          name: 在环回设备上为镜像安装 GRUB BIOS（尝试，失败则报错）
-          command: |
-            set -euo pipefail
-            RELEASE=${RELEASE:-<< parameters.debian_release >>}
-            IMG_FILE="debian-${RELEASE}-btrfs.img"
-            MOUNT_DIR=/mnt/debian-boot-attach
-            sudo mkdir -p "$MOUNT_DIR"
-
-            LOOP_DEV=$(sudo losetup --show -fP "$IMG_FILE")
-            sleep 1
-            if [ -b "${LOOP_DEV}p1" ]; then
-              PART_DEV="${LOOP_DEV}p1"
-            else
-              KOUT=$(sudo kpartx -av "$LOOP_DEV" 2>/dev/null || true)
-              PART_DEV=$(echo "$KOUT" | awk '{print "/dev/mapper/" $3; exit}' || true)
-            fi
-
-            if [ -z "${PART_DEV:-}" ] || [ ! -b "$PART_DEV" ]; then
-              echo "未找到分区设备，无法安装 GRUB" >&2
-              sudo losetup -d "$LOOP_DEV" || true
-              exit 1
-            fi
-
-            sudo mount -o subvol=@,compress-force=zstd:9,discard=async,noatime "$PART_DEV" "$MOUNT_DIR"
-            for fs in proc sys dev run; do sudo mount --bind "/$fs" "$MOUNT_DIR/$fs"; done
-            sudo cp /etc/resolv.conf "$MOUNT_DIR/etc/resolv.conf" || true
-            sudo mkdir -p "$MOUNT_DIR/boot"
-
-            if sudo chroot "$MOUNT_DIR" /bin/bash -c "command -v grub-install >/dev/null 2>&1"; then
-              sudo chroot "$MOUNT_DIR" /bin/bash -c "grub-install --target=i386-pc --recheck --boot-directory=/boot $LOOP_DEV"
-              sudo chroot "$MOUNT_DIR" /bin/bash -c "update-grub || true"
-            else
-              echo "chroot 中未检测到 grub-install，安装可能失败" >&2
-              for fs in run dev sys proc; do sudo umount "$MOUNT_DIR/$fs" || true; done
-              sudo umount "$MOUNT_DIR" || true
-              sudo losetup -d "$LOOP_DEV" || true
-              exit 1
-            fi
-
-            for fs in run dev sys proc; do sudo umount "$MOUNT_DIR/$fs" || true; done
-            sudo umount "$MOUNT_DIR" || true
-            if command -v kpartx >/dev/null 2>&1; then sudo kpartx -dv "$LOOP_DEV" || true; fi
-            sudo losetup -d "$LOOP_DEV" || true
-            sudo rmdir "$MOUNT_DIR" || true
-
-      - run:
-          name: 转换为 qcow2 并根据 qcow2 的 sha256 生成最终文件名
-          command: |
-            set -euo pipefail
-            RELEASE=${RELEASE:-<< parameters.debian_release >>}
-            IMG_FILE="debian-${RELEASE}-btrfs.img"
-            QCOW2_TMP="debian-${RELEASE}-btrfs.tmp.qcow2"
-            qemu-img convert -p -O qcow2 -c -o cluster_size=512k "$IMG_FILE" "$QCOW2_TMP"
-            SHA256=$(sha256sum "$QCOW2_TMP" | awk '{print $1}' | cut -c1-8)
-            QCOW2_FINAL="debian-${RELEASE}-btrfs-bios-${SHA256}.qcow2"
-            mv -f "$QCOW2_TMP" "$QCOW2_FINAL"
-            QCOW2_LATEST="debian-${RELEASE}-btrfs-bios-latest.qcow2"
-            ln -f "$QCOW2_FINAL" "$QCOW2_LATEST"
-            ls -lh "$QCOW2_FINAL" "$QCOW2_LATEST"
-            qemu-img info "$QCOW2_FINAL"
-
-      - run:
-          name: 安装 gh 并上传到 GitHub Release
-          command: |
-            set -euo pipefail
-            export DEBIAN_FRONTEND=noninteractive
-            export APT_LISTCHANGES_FRONTEND=none
-            type -p curl >/dev/null || sudo apt install -y curl
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
-              sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
-              sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-              echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
-              sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
-              sudo apt update && sudo apt install -y gh
-            RELEASE=<< parameters.debian_release >>
-            : "${GH_TOKEN:?GH_TOKEN is required}"
-            export GITHUB_TOKEN=$GH_TOKEN
-            TAG_NAME="${CIRCLE_TAG:-manual-$(date +%s)}"
-            shopt -s nullglob
-            SHA_FILES=(debian-${RELEASE}-btrfs-bios-*.qcow2)
-            shopt -u nullglob
-            LATEST_FILE="debian-${RELEASE}-btrfs-bios-latest.qcow2"
-            SHA_FOUND=false
-            for f in "${SHA_FILES[@]}"; do
-              if [ -f "$f" ] && [[ "$f" != *"-latest.qcow2" ]]; then
-                SHA_FOUND=true
-                break
-              fi
-            done
-            [ "$SHA_FOUND" = true ] || { echo "找不到任何 sha 命名的 qcow2 文件" >&2; exit 1; }
-            if ! gh release view "$TAG_NAME" > /dev/null 2>&1; then
-              gh release create "$TAG_NAME" --title "Debian Btrfs Cloud Image $TAG_NAME" --notes "自动发布自定义 Debian ${RELEASE} Btrfs 压缩镜像" || echo "Release 可能已被另一个 Job 创建"
-            fi
-            for f in "${SHA_FILES[@]}"; do
-              if [ -f "$f" ] && [[ "$f" != *"-latest.qcow2" ]]; then
-                gh release upload "$TAG_NAME" "$f" --clobber || true
-              fi
-            done
-            if [ -f "$LATEST_FILE" ]; then
-              gh release upload "$TAG_NAME" "$LATEST_FILE" --clobber || true
-            fi
-            gh release edit "$TAG_NAME" --latest
-            sudo rm -f /usr/sbin/policy-rc.d || true
-
-
-  debian-btrfs-bios-uefi-build:
-    machine:
-      image: ubuntu-2204:current
-      resource_class: medium
-    parameters:
-      debian_release:
-        type: string
-    steps:
-      - checkout
-
-      - run:
-          name: 安装基础工具（非交互）
-          command: |
-            set -euo pipefail
-            sudo tee /usr/sbin/policy-rc.d > /dev/null \<<'EOF'
-            #!/bin/sh
-            exit 101
-            EOF
-            sudo chmod +x /usr/sbin/policy-rc.d
-            export DEBIAN_FRONTEND=noninteractive
-            export APT_LISTCHANGES_FRONTEND=none
-            sudo apt update
-            sudo apt install -y debootstrap btrfs-progs qemu-utils qemu-user-static libguestfs-tools axel wget curl util-linux rsync gdisk grub-pc-bin kpartx
-
-      - run:
-          name: debootstrap -> chroot 安装（含 EFI 包）
-          command: |
-            set -euo pipefail
-            RELEASE=<< parameters.debian_release >>
-            DEBOOT_DIR=/tmp/debootstrap-root
-            sudo rm -rf "$DEBOOT_DIR"
-            sudo mkdir -p "$DEBOOT_DIR"
-            sudo debootstrap --arch=amd64 --variant=minbase "$RELEASE" "$DEBOOT_DIR" https://deb.debian.org/debian
-            sudo cp /etc/resolv.conf "$DEBOOT_DIR/etc/resolv.conf"
-            for fs in proc sys dev; do sudo mount --bind "/$fs" "$DEBOOT_DIR/$fs"; done
-            sudo tee "$DEBOOT_DIR/usr/sbin/policy-rc.d" > /dev/null \<<'EOF'
-            #!/bin/sh
-            exit 101
-            EOF
-            sudo chmod +x "$DEBOOT_DIR/usr/sbin/policy-rc.d"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "\
-              export DEBIAN_FRONTEND=noninteractive; \
-              export APT_LISTCHANGES_FRONTEND=none; \
-              apt-get update && \
-              apt-get -y -o DPkg::Options::='--force-confdef' -o DPkg::Options::='--force-confold' \
-                install cloud-init openssh-server locales tzdata linux-image-cloud-amd64 initramfs-tools grub-pc-bin btrfs-progs btrfs-compsize haveged unattended-upgrades dbus \
-                wget htop curl iproute2 net-tools ifupdown isc-dhcp-client python3-requests ca-certificates dialog perl-modules \
-                dosfstools grub-efi-amd64 grub-efi-amd64-bin efibootmgr && \
-              sed -i '/en_US.UTF-8 UTF-8/s/^# //g' /etc/locale.gen && locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && \
-              apt-get -y autoremove && apt-get -y clean \
-            "
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "ln -sf /usr/share/zoneinfo/Asia/Hong_Kong /etc/localtime && dpkg-reconfigure -f noninteractive tzdata"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "echo 'APT::Periodic::Update-Package-Lists \"1\";' > /etc/apt/apt.conf.d/20auto-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "echo 'APT::Periodic::Unattended-Upgrade \"1\";' >> /etc/apt/apt.conf.d/20auto-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "sed -i 's/.*Unattended-Upgrade::Remove-Unused-Dependencies.*/Unattended-Upgrade::Remove-Unused-Dependencies \"true\";/' /etc/apt/apt.conf.d/50unattended-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "sed -i 's/.*Unattended-Upgrade::Remove-Unused-Kernel-Packages.*/Unattended-Upgrade::Remove-Unused-Kernel-Packages \"true\";/' /etc/apt/apt.conf.d/50unattended-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "echo 'Unattended-Upgrade::Post-Invoke-Purge \"true\";' >> /etc/apt/apt.conf.d/50unattended-upgrades"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "passwd -d root && sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "rm -rf /usr/share/doc/* /var/cache/apt/* /var/lib/apt/lists/*"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "find /usr/share/locale/ -mindepth 1 -maxdepth 1 ! -name 'en*' -exec rm -rf {} +"
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "cat /etc/passwd && cat /etc/shadow"
-            sudo chroot "$DEBOOT_DIR" rm -f /etc/ssh/ssh_host_*
-            sudo rm -f "$DEBOOT_DIR/var/lib/dbus/machine-id"
-            for fs in dev sys proc; do sudo umount "$DEBOOT_DIR/$fs" || true; done
-
-      - run:
-          name: 创建带分区表的 btrfs 镜像（含 1MiB BIOS + 32MiB ESP）
-          command: |
-            set -euo pipefail
-            RELEASE=${RELEASE:-<< parameters.debian_release >>}
-            IMG_SIZE=1G
-            IMG_FILE="debian-${RELEASE}-btrfs.img"
-            sudo rm -f "$IMG_FILE"
-            sudo fallocate -l "$IMG_SIZE" "$IMG_FILE"
-
-            sudo parted --script "$IMG_FILE" \
-              mklabel gpt \
-              mkpart primary 1MiB 2MiB \
-              name 1 bios_grub \
-              set 1 bios_grub on \
-              mkpart ESP fat32 2MiB 35MiB \
-              set 2 boot on \
-              name 2 efi \
-              mkpart primary 35MiB 100% \
-              name 3 root
-
-            LOOP_DEV=$(sudo losetup --show -fP "$IMG_FILE")
-            sleep 1
-
+            # 明确分配分区变量
             if [ -b "${LOOP_DEV}p1" ]; then
               PART1_DEV="${LOOP_DEV}p1"
-              PART2_DEV="${LOOP_DEV}p2"
-              PART3_DEV="${LOOP_DEV}p3"
+              [ $PART_COUNT -ge 2 ] && PART2_DEV="${LOOP_DEV}p2" || PART2_DEV=""
+              [ $PART_COUNT -ge 3 ] && PART3_DEV="${LOOP_DEV}p3" || PART3_DEV=""
             else
               KOUT=$(sudo kpartx -av "$LOOP_DEV" 2>/dev/null || true)
-              PART1_DEV=$(echo "$KOUT" | awk '/p1/ {print "/dev/mapper/" $3; exit}' || true)
-              PART2_DEV=$(echo "$KOUT" | awk '/p2/ {print "/dev/mapper/" $3; exit}' || true)
-              PART3_DEV=$(echo "$KOUT" | awk '/p3/ {print "/dev/mapper/" $3; exit}' || true)
+              PART1_DEV=$(echo "$KOUT" | awk '/p1/ {print "/dev/mapper/" $3; exit}' || echo "")
+              PART2_DEV=$(echo "$KOUT" | awk '/p2/ {print "/dev/mapper/" $3; exit}' || echo "")
+              PART3_DEV=$(echo "$KOUT" | awk '/p3/ {print "/dev/mapper/" $3; exit}' || echo "")
             fi
 
-            if [ -z "${PART3_DEV:-}" ] || [ ! -b "$PART3_DEV" ]; then
-              echo "未能映射到分区设备，清理并退出" >&2
-              sudo losetup -d "$LOOP_DEV" || true
-              exit 1
+            # 验证根分区设备
+            if [ "$BOOT_MODE" = "bios-uefi" ]; then
+              ROOT_DEV="$PART3_DEV"
+              [ -z "$ROOT_DEV" ] || [ ! -b "$ROOT_DEV" ] && { echo "root 分区映射失败"; sudo losetup -d "$LOOP_DEV" || true; exit 1; }
+            else
+              ROOT_DEV="$PART1_DEV"
+              [ -z "$ROOT_DEV" ] || [ ! -b "$ROOT_DEV" ] && { echo "root 分区映射失败"; sudo losetup -d "$LOOP_DEV" || true; exit 1; }
             fi
 
-            # BIOS 分区不格式化；ESP vfat；root 为 btrfs
-            sudo mkfs.vfat -F32 -n EFI "${PART2_DEV}"
-            sudo mkfs.btrfs -f -M -n 4k -L "debian_${RELEASE}_btrfs" "${PART3_DEV}"
+            # 格式化分区
+            if [ "$BOOT_MODE" = "bios-uefi" ]; then
+              [ -n "$PART2_DEV" ] && [ -b "$PART2_DEV" ] && sudo mkfs.vfat -F32 -n EFI "$PART2_DEV"
+            fi
+            sudo mkfs.btrfs -f -M -n 4k -L "debian_${RELEASE}_btrfs" "$ROOT_DEV"
 
+            # 创建 btrfs 子卷
             MOUNT_DIR=/mnt/debian-root
             sudo mkdir -p "$MOUNT_DIR"
-            sudo mount -o loop,compress=zstd:9,noatime "${PART3_DEV}" "$MOUNT_DIR"
+            sudo mount -o loop,compress=zstd:9,noatime "$ROOT_DEV" "$MOUNT_DIR"
             sudo btrfs subvolume create "$MOUNT_DIR/@" || true
             sudo umount "$MOUNT_DIR"
 
-            if command -v kpartx >/dev/null 2>&1; then sudo kpartx -dv "$LOOP_DEV" || true; fi
+            command -v kpartx >/dev/null 2>&1 && sudo kpartx -dv "$LOOP_DEV" || true
             sudo losetup -d "$LOOP_DEV" || true
 
       - run:
-          name: 复制文件、清理并准备 EFI（写入 @ 子卷 并写入 ESP）
+          name: 复制系统文件和配置
           command: |
             set -euo pipefail
             RELEASE=${RELEASE:-<< parameters.debian_release >>}
+            BOOT_MODE=<< parameters.boot_mode >>
             DEBOOT_DIR=/tmp/debootstrap-root
             IMG_FILE="debian-${RELEASE}-btrfs.img"
             MOUNT_DIR=/mnt/debian-root
@@ -396,30 +192,44 @@ jobs:
 
             LOOP_DEV=$(sudo losetup --show -fP "$IMG_FILE")
             sleep 1
+
             if [ -b "${LOOP_DEV}p1" ]; then
               PART1_DEV="${LOOP_DEV}p1"
               PART2_DEV="${LOOP_DEV}p2"
               PART3_DEV="${LOOP_DEV}p3"
             else
               KOUT=$(sudo kpartx -av "$LOOP_DEV" 2>/dev/null || true)
-              PART1_DEV=$(echo "$KOUT" | awk '/p1/ {print "/dev/mapper/" $3; exit}' || true)
-              PART2_DEV=$(echo "$KOUT" | awk '/p2/ {print "/dev/mapper/" $3; exit}' || true)
-              PART3_DEV=$(echo "$KOUT" | awk '/p3/ {print "/dev/mapper/" $3; exit}' || true)
-            fi
-            if [ -z "${PART3_DEV:-}" ] || [ ! -b "$PART3_DEV" ]; then
-              echo "未找到分区设备，退出" >&2
-              sudo losetup -d "$LOOP_DEV" || true
-              exit 1
+              PART1_DEV=$(echo "$KOUT" | awk '/p1/ {print "/dev/mapper/" $3; exit}' || echo "")
+              PART2_DEV=$(echo "$KOUT" | awk '/p2/ {print "/dev/mapper/" $3; exit}' || echo "")
+              PART3_DEV=$(echo "$KOUT" | awk '/p3/ {print "/dev/mapper/" $3; exit}' || echo "")
             fi
 
-            sudo mount -o subvol=@,compress-force=zstd:9,discard=async,noatime "$PART3_DEV" "$MOUNT_DIR"
-            sudo mount "${PART2_DEV}" "$ESP_MOUNT" || true
+            if [ "$BOOT_MODE" = "bios-uefi" ]; then
+              ROOT_DEV="$PART3_DEV"
+              EFI_DEV="$PART2_DEV"
+            else
+              ROOT_DEV="$PART1_DEV"
+              EFI_DEV=""
+            fi
+
+            [ -z "$ROOT_DEV" ] || [ ! -b "$ROOT_DEV" ] && { echo "根分区设备不可用"; sudo losetup -d "$LOOP_DEV" || true; exit 1; }
+
+            sudo mount -o subvol=@,compress-force=zstd:9,discard=async,noatime "$ROOT_DEV" "$MOUNT_DIR"
+
+            if [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ]; then
+              sudo mount "$EFI_DEV" "$ESP_MOUNT" || true
+            fi
+
             sudo rsync -aHAX --numeric-ids --sparse --delete "$DEBOOT_DIR"/ "$MOUNT_DIR"/
             sudo mkdir -p "$MOUNT_DIR/boot/efi"
-            sudo umount "$ESP_MOUNT" || true
-            sudo mount "${PART2_DEV}" "$MOUNT_DIR/boot/efi"
+
+            if [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ]; then
+              sudo umount "$ESP_MOUNT" || true
+              sudo mount "$EFI_DEV" "$MOUNT_DIR/boot/efi"
+            fi
 
             sudo truncate -s 0 "$MOUNT_DIR/etc/machine-id" || true
+            sudo rm -f "$MOUNT_DIR/var/lib/dbus/machine-id" || true
             cat \<<EOF | sudo tee "$MOUNT_DIR/etc/cloud/cloud.cfg.d/99-custom.cfg" > /dev/null
             datasource_list: [ AliYun, ConfigDrive, None ]
             manage_etc_hosts: true
@@ -431,95 +241,117 @@ jobs:
               network:
                 renderers: ['eni']
             EOF
+
             sudo chroot "$MOUNT_DIR" /bin/bash -c "cloud-init clean --logs --seed" || true
-            NEW_UUID=$(sudo blkid -s UUID -o value "$PART3_DEV")
-            ESP_UUID=$(sudo blkid -s UUID -o value "$PART2_DEV" || true)
+
+            NEW_UUID=$(sudo blkid -s UUID -o value "$ROOT_DEV")
             sudo mkdir -p "$MOUNT_DIR/etc"
             echo "UUID=$NEW_UUID / btrfs subvol=@,compress-force=zstd:9,defaults,discard=async 0 0" | sudo tee "$MOUNT_DIR/etc/fstab" > /dev/null
-            if [ -n "$ESP_UUID" ]; then
-              echo "UUID=$ESP_UUID /boot/efi vfat defaults,umask=0077 0 1" | sudo tee -a "$MOUNT_DIR/etc/fstab" > /dev/null
+
+            if [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ]; then
+              ESP_UUID=$(sudo blkid -s UUID -o value "$EFI_DEV" || echo "")
+              [ -n "$ESP_UUID" ] && echo "UUID=$ESP_UUID /boot/efi vfat defaults,umask=0077 0 1" | sudo tee -a "$MOUNT_DIR/etc/fstab" > /dev/null
             fi
+
             sudo cat "$MOUNT_DIR/etc/fstab"
             sudo rm -rf "$MOUNT_DIR/var/log/"* "$MOUNT_DIR/var/cache/"* "$MOUNT_DIR/tmp/"* || true
             sudo rm -f "$MOUNT_DIR/usr/sbin/policy-rc.d" || true
-            sudo umount "$MOUNT_DIR/boot/efi" || true
+
+            if [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ]; then
+              sudo umount "$MOUNT_DIR/boot/efi" || true
+            fi
             sudo umount "$MOUNT_DIR"
 
       - run:
-          name: 在环回设备上为镜像安装 GRUB BIOS+UEFI（尝试，失败则报错）
+          name: 安装 GRUB 引导
           command: |
             set -euo pipefail
             RELEASE=${RELEASE:-<< parameters.debian_release >>}
+            BOOT_MODE=<< parameters.boot_mode >>
             IMG_FILE="debian-${RELEASE}-btrfs.img"
             MOUNT_DIR=/mnt/debian-boot-attach
             sudo mkdir -p "$MOUNT_DIR"
 
             LOOP_DEV=$(sudo losetup --show -fP "$IMG_FILE")
             sleep 1
+
             if [ -b "${LOOP_DEV}p1" ]; then
               PART1_DEV="${LOOP_DEV}p1"
               PART2_DEV="${LOOP_DEV}p2"
               PART3_DEV="${LOOP_DEV}p3"
             else
               KOUT=$(sudo kpartx -av "$LOOP_DEV" 2>/dev/null || true)
-              PART1_DEV=$(echo "$KOUT" | awk '/p1/ {print "/dev/mapper/" $3; exit}' || true)
-              PART2_DEV=$(echo "$KOUT" | awk '/p2/ {print "/dev/mapper/" $3; exit}' || true)
-              PART3_DEV=$(echo "$KOUT" | awk '/p3/ {print "/dev/mapper/" $3; exit}' || true)
+              PART1_DEV=$(echo "$KOUT" | awk '/p1/ {print "/dev/mapper/" $3; exit}' || echo "")
+              PART2_DEV=$(echo "$KOUT" | awk '/p2/ {print "/dev/mapper/" $3; exit}' || echo "")
+              PART3_DEV=$(echo "$KOUT" | awk '/p3/ {print "/dev/mapper/" $3; exit}' || echo "")
             fi
 
-            if [ -z "${PART3_DEV:-}" ] || [ ! -b "$PART3_DEV" ]; then
-              echo "未找到分区设备，无法安装 GRUB" >&2
-              sudo losetup -d "$LOOP_DEV" || true
-              exit 1
+            if [ "$BOOT_MODE" = "bios-uefi" ]; then
+              ROOT_DEV="$PART3_DEV"
+              EFI_DEV="$PART2_DEV"
+            else
+              ROOT_DEV="$PART1_DEV"
+              EFI_DEV=""
             fi
 
-            sudo mount -o subvol=@,compress-force=zstd:9,discard=async,noatime "$PART3_DEV" "$MOUNT_DIR"
-            sudo mount "$PART2_DEV" "$MOUNT_DIR/boot/efi"
+            [ -z "$ROOT_DEV" ] || [ ! -b "$ROOT_DEV" ] && { echo "根分区不可用"; sudo losetup -d "$LOOP_DEV" || true; exit 1; }
+
+            sudo mount -o subvol=@,compress-force=zstd:9,discard=async,noatime "$ROOT_DEV" "$MOUNT_DIR"
+
+            if [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ]; then
+              sudo mount "$EFI_DEV" "$MOUNT_DIR/boot/efi"
+            fi
+
             for fs in proc sys dev run; do sudo mount --bind "/$fs" "$MOUNT_DIR/$fs"; done
             sudo cp /etc/resolv.conf "$MOUNT_DIR/etc/resolv.conf" || true
+            sudo mkdir -p "$MOUNT_DIR/boot"
 
+            # 统一 grub-install 调用
             if sudo chroot "$MOUNT_DIR" /bin/bash -c "command -v grub-install >/dev/null 2>&1"; then
-              # UEFI 安装到 /boot/efi
-              sudo chroot "$MOUNT_DIR" /bin/bash -c "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian --removable --recheck || true"
-              sudo chroot "$MOUNT_DIR" /bin/bash -c "grub-install --target=i386-pc --recheck --boot-directory=/boot $LOOP_DEV || true"
-              sudo chroot "$MOUNT_DIR" /bin/bash -c "update-grub || true"
+              if [ "$BOOT_MODE" = "bios-uefi" ]; then
+                sudo chroot "$MOUNT_DIR" /bin/bash -c "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian --removable --recheck || true; grub-install --target=i386-pc --recheck --boot-directory=/boot /dev/loop0 || true; update-grub || true"
+              else
+                sudo chroot "$MOUNT_DIR" /bin/bash -c "grub-install --target=i386-pc --recheck --boot-directory=/boot /dev/loop0; update-grub || true"
+              fi
             else
-              echo "chroot 中未检测到 grub-install，安装可能失败" >&2
+              echo "grub-install 不可用" >&2
               for fs in run dev sys proc; do sudo umount "$MOUNT_DIR/$fs" || true; done
-              sudo umount "$MOUNT_DIR/boot/efi" || true
+              [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ] && sudo umount "$MOUNT_DIR/boot/efi" || true
               sudo umount "$MOUNT_DIR" || true
               sudo losetup -d "$LOOP_DEV" || true
               exit 1
             fi
+
             for fs in run dev sys proc; do sudo umount "$MOUNT_DIR/$fs" || true; done
-            sudo umount "$MOUNT_DIR/boot/efi" || true
+            [ -n "$EFI_DEV" ] && [ -b "$EFI_DEV" ] && sudo umount "$MOUNT_DIR/boot/efi" || true
             sudo umount "$MOUNT_DIR" || true
-            if command -v kpartx >/dev/null 2>&1; then sudo kpartx -dv "$LOOP_DEV" || true; fi
+            command -v kpartx >/dev/null 2>&1 && sudo kpartx -dv "$LOOP_DEV" || true
             sudo losetup -d "$LOOP_DEV" || true
             sudo rmdir "$MOUNT_DIR" || true
 
       - run:
-          name: 转换为 qcow2 并根据 qcow2 的 sha256 生成最终文件名
+          name: 转换为 qcow2 并生成最终文件名
           command: |
             set -euo pipefail
             RELEASE=${RELEASE:-<< parameters.debian_release >>}
+            BOOT_MODE=<< parameters.boot_mode >>
             IMG_FILE="debian-${RELEASE}-btrfs.img"
             QCOW2_TMP="debian-${RELEASE}-btrfs.tmp.qcow2"
+            SUFFIX=$([ "$BOOT_MODE" = "bios-uefi" ] && echo "bios-uefi" || echo "bios")
             qemu-img convert -p -O qcow2 -c -o cluster_size=512k "$IMG_FILE" "$QCOW2_TMP"
             SHA256=$(sha256sum "$QCOW2_TMP" | awk '{print $1}' | cut -c1-8)
-            QCOW2_FINAL="debian-${RELEASE}-btrfs-bios-uefi-${SHA256}.qcow2"
+            QCOW2_FINAL="debian-${RELEASE}-btrfs-${SUFFIX}-${SHA256}.qcow2"
             mv -f "$QCOW2_TMP" "$QCOW2_FINAL"
-            QCOW2_LATEST="debian-${RELEASE}-btrfs-bios-uefi-latest.qcow2"
+            QCOW2_LATEST="debian-${RELEASE}-btrfs-${SUFFIX}-latest.qcow2"
             ln -f "$QCOW2_FINAL" "$QCOW2_LATEST"
             ls -lh "$QCOW2_FINAL" "$QCOW2_LATEST"
             qemu-img info "$QCOW2_FINAL"
 
       - run:
-          name: 安装 gh 并上传到 GitHub Release
+          name: 上传到 GitHub Release
           command: |
             set -euo pipefail
-            export DEBIAN_FRONTEND=noninteractive
-            export APT_LISTCHANGES_FRONTEND=none
+            export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
             type -p curl >/dev/null || sudo apt install -y curl
             curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
               sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
@@ -527,40 +359,36 @@ jobs:
               echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
               sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
               sudo apt update && sudo apt install -y gh
+
             RELEASE=<< parameters.debian_release >>
+            BOOT_MODE=<< parameters.boot_mode >>
+            SUFFIX=$([ "$BOOT_MODE" = "bios-uefi" ] && echo "bios-uefi" || echo "bios")
             : "${GH_TOKEN:?GH_TOKEN is required}"
             export GITHUB_TOKEN=$GH_TOKEN
             TAG_NAME="${CIRCLE_TAG:-manual-$(date +%s)}"
+
             shopt -s nullglob
-            SHA_FILES=(debian-${RELEASE}-btrfs-bios-uefi-*.qcow2)
+            SHA_FILES=(debian-${RELEASE}-btrfs-${SUFFIX}-*.qcow2)
             shopt -u nullglob
-            LATEST_FILE="debian-${RELEASE}-btrfs-bios-uefi-latest.qcow2"
-            SHA_FOUND=false
-            for f in "${SHA_FILES[@]}"; do
-              if [ -f "$f" ] && [[ "$f" != *"-latest.qcow2" ]]; then
-                SHA_FOUND=true
-                break
-              fi
-            done
-            [ "$SHA_FOUND" = true ] || { echo "找不到任何 sha 命名的 qcow2 文件" >&2; exit 1; }
+            LATEST_FILE="debian-${RELEASE}-btrfs-${SUFFIX}-latest.qcow2"
+
+            [ ${#SHA_FILES[@]} -gt 0 ] || { echo "未找到 qcow2 文件" >&2; exit 1; }
+
             if ! gh release view "$TAG_NAME" > /dev/null 2>&1; then
-              gh release create "$TAG_NAME" --title "Debian Btrfs Cloud Image $TAG_NAME" --notes "自动发布自定义 Debian ${RELEASE} Btrfs 压缩镜像" || echo "Release 可能已被另一个 Job 创建"
+              gh release create "$TAG_NAME" --title "Debian Btrfs Cloud Image $TAG_NAME" --notes "自动发布 Debian ${RELEASE} Btrfs 镜像" || true
             fi
+
             for f in "${SHA_FILES[@]}"; do
-              if [ -f "$f" ] && [[ "$f" != *"-latest.qcow2" ]]; then
-                gh release upload "$TAG_NAME" "$f" --clobber || true
-              fi
+              [ -f "$f" ] && gh release upload "$TAG_NAME" "$f" --clobber || true
             done
-            if [ -f "$LATEST_FILE" ]; then
-              gh release upload "$TAG_NAME" "$LATEST_FILE" --clobber || true
-            fi
+            [ -f "$LATEST_FILE" ] && gh release upload "$TAG_NAME" "$LATEST_FILE" --clobber || true
             gh release edit "$TAG_NAME" --latest
             sudo rm -f /usr/sbin/policy-rc.d || true
 
   upload-to-aliyun:
     machine:
       image: ubuntu-2204:current
-    resource_class: medium
+      resource_class: medium
     steps:
       - checkout
 
@@ -568,59 +396,47 @@ jobs:
           name: 安装依赖工具
           command: |
             set -euo pipefail
-            sudo apt-get update
-            sudo apt-get install -y curl tar jq ca-certificates
+            sudo apt-get update && sudo apt-get install -y curl tar jq ca-certificates
             curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
             sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
             sudo apt-get update && sudo apt-get install -y gh
             curl -sSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz -o /tmp/aliyun-cli.tgz
             tar -xzf /tmp/aliyun-cli.tgz -C /tmp && sudo mv /tmp/aliyun /usr/local/bin/aliyun && sudo chmod +x /usr/local/bin/aliyun
 
       - run:
-          name: 下载Release文件
+          name: 从 GitHub Release 下载镜像
           command: |
             set -euo pipefail
             export GITHUB_TOKEN=${GH_TOKEN}
             mkdir -p /tmp/artifacts
             LATEST_TAG=$(gh release view --json tagName -q .tagName)
-            echo "latest tag: $LATEST_TAG"
-            gh release view "$LATEST_TAG" --json assets \
-              | jq -r '.assets[].name | select(endswith(".qcow2") and (endswith("latest.qcow2") | not))' \
-              | while IFS= read -r NAME || [ -n "$NAME" ]; do
-                  echo "download: $NAME"
-                  gh release download "$LATEST_TAG" --pattern "$NAME" --dir /tmp/artifacts > "/tmp/gh_download_${NAME//[^A-Za-z0-9._-]/_}.out" 2> "/tmp/gh_download_${NAME//[^A-Za-z0-9._-]/_}.err" || {
-                    echo "下载失败: $NAME (查看 /tmp/gh_download_*.err)" >&2
-                    cat "/tmp/gh_download_${NAME//[^A-Za-z0-9._-]/_}.err" >&2
-                    exit 1
-                  }
-                done
-            ls -lah /tmp/artifacts || true
+            echo "Latest tag: $LATEST_TAG"
+            gh release view "$LATEST_TAG" --json assets | jq -r '.assets[].name | select(endswith(".qcow2") and (endswith("latest.qcow2") | not))' | while read -r NAME; do
+              echo "Downloading: $NAME"
+              gh release download "$LATEST_TAG" --pattern "$NAME" --dir /tmp/artifacts
+            done
+            ls -lah /tmp/artifacts
 
       - run:
-          name: 配置阿里云CLI
+          name: 配置阿里云 CLI 并上传到 OSS
           command: |
             set -euo pipefail
             REGION="${OSS_REGION:-${ALIYUN_REGION:-}}"
             sudo aliyun configure set --profile default --region "${REGION}" --access-key-id "${ALIYUN_ACCESS_KEY_ID}" --access-key-secret "${ALIYUN_ACCESS_KEY_SECRET}"
-
-      - run:
-          name: 上传到 OSS
-          command: |
-            set -euo pipefail
-            BUCKET="${OSS_BUCKET}"; REGION="${OSS_REGION}"; PREFIX="${OSS_PATH:-releases}"
+            BUCKET="${OSS_BUCKET}"; PREFIX="${OSS_PATH:-releases}"
             COUNT=0
             for f in /tmp/artifacts/*.qcow2; do
               [ -f "$f" ] || continue
               BASENAME=$(basename "$f")
-              echo "upload: ${BASENAME} -> oss://${BUCKET}/${PREFIX}/"
+              echo "Uploading: ${BASENAME}"
               sudo aliyun oss cp "$f" "oss://${BUCKET}/${PREFIX}/${BASENAME}" --region "${REGION}" --force
               ((++COUNT))
             done
             echo "上传完成: ${COUNT} 个文件"
 
       - run:
-          name: 异步并行导入镜像并轮询状态，完成后删除OSS文件
+          name: 并行导入镜像并轮询状态，完成后删除OSS文件
           command: |
             set -euo pipefail
             REGION="${OSS_REGION}"; BUCKET="${OSS_BUCKET}"; PREFIX="${OSS_PATH:-releases}"
@@ -669,31 +485,32 @@ jobs:
                     ;;
                 esac
               done
-              [ $FINISHED_IN_LOOP -eq ${#TASK_MAP[@]} ] && { echo "所有任务已到达终态。"; break; }
+              [ $FINISHED_IN_LOOP -eq ${#TASK_MAP[@]} ] && { echo "所有任务已完成。"; break; }
             done
             [ $iter -ge $MAX_ITER ] && { echo "轮询超时，部分任务未完成。"; exit 1; }
             [ $ERROR_COUNT -gt 0 ] && { echo "同步过程中存在 $ERROR_COUNT 个失败任务。"; exit 1; }
             echo "所有镜像导入任务已成功完成！"
 
-
 workflows:
   debian-btrfs_build_and_release:
     jobs:
-      - debian-btrfs-bios-build:
+      - build-debian-btrfs-image:
+          name: "build-debian-btrfs-bios"
+          boot_mode: "bios"
           debian_release: << pipeline.parameters.debian_release >>
           filters: &tag_filters
             tags:
               only: /^v.*/
             branches:
               ignore: /.*/
-      - debian-btrfs-bios-uefi-build:
+      - build-debian-btrfs-image:
+          name: "build-debian-btrfs-bios-uefi"
+          boot_mode: "bios-uefi"
           debian_release: << pipeline.parameters.debian_release >>
           filters: *tag_filters
       - upload-to-aliyun:
           filters:
             tags:
-              only:
-                - /^upload-aliyun-.*$/
+              only: /^upload-aliyun-.*$/
             branches:
               ignore: /.*/
-
