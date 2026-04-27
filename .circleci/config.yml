@@ -93,7 +93,10 @@ jobs:
             echo 'Unattended-Upgrade::Post-Invoke-Purge "true";' >> /etc/apt/apt.conf.d/50unattended-upgrades
             passwd -d root
 
-            # 清理和本地化
+            grep -q "^GRUB_TIMEOUT=" /etc/default/grub && sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' /etc/default/grub || echo 'GRUB_TIMEOUT=1' >> /etc/default/grub
+            grep -q "^GRUB_TIMEOUT_STYLE=" /etc/default/grub && sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub || echo 'GRUB_TIMEOUT_STYLE=menu' >> /etc/default/grub
+            sed -i '/GRUB_RECORDFAIL_TIMEOUT/d' /etc/default/grub; echo 'GRUB_RECORDFAIL_TIMEOUT=0' >> /etc/default/grub
+
             rm -rf /usr/share/doc/* /var/cache/apt/* /var/lib/apt/lists/*
             find /usr/share/locale/ -mindepth 1 -maxdepth 1 ! -name 'en*' -exec rm -rf {} +
             cat /etc/passwd && cat /etc/shadow
