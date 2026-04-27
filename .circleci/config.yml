@@ -41,6 +41,7 @@ jobs:
           name: debootstrap -> chroot 系统配置
           command: |
             set -euo pipefail
+            source .circleci/scripts/disk-utils.sh
             RELEASE=<< parameters.debian_release >>
             BOOT_MODE=<< parameters.boot_mode >>
             DEBOOT_DIR=/tmp/debootstrap-root
@@ -48,7 +49,7 @@ jobs:
             sudo mkdir -p "$DEBOOT_DIR"
             sudo debootstrap --arch=amd64 --variant=minbase "$RELEASE" "$DEBOOT_DIR" https://deb.debian.org/debian
             sudo cp /etc/resolv.conf "$DEBOOT_DIR/etc/resolv.conf"
-            for fs in proc sys dev; do sudo mount --bind "/$fs" "$DEBOOT_DIR/$fs"; done
+            mount_virtual_filesystems "$DEBOOT_DIR"
             sudo tee "$DEBOOT_DIR/usr/sbin/policy-rc.d" > /dev/null \<<'EOF'
             #!/bin/sh
             exit 101
@@ -101,7 +102,7 @@ jobs:
             CHROOT_SCRIPT
             )"
 
-            for fs in proc sys dev; do sudo umount "$DEBOOT_DIR/$fs" || true; done
+            umount_virtual_filesystems "$DEBOOT_DIR"
 
       - run:
           name: 创建分区镜像（条件化：MBR 或 GPT）
@@ -159,11 +160,19 @@ jobs:
             init_and_setup_loop "<< parameters.debian_release >>" "<< parameters.boot_mode >>" || \
               error_cleanup "$LOOP_DEV"
 
+            umount_virtual_filesystems "$DEBOOT_DIR" || true
             # 挂载根分区
             mount_root_filesystem "$MOUNT_DIR"
 
+            if [ -z "$(ls -A "$DEBOOT_DIR")" ]; then
+              echo "错误: $DEBOOT_DIR 是空的，同步终止" >&2
+              exit 1
+            fi
+
             # 复制系统文件
             sudo rsync -aHAX --numeric-ids --sparse --delete "$DEBOOT_DIR"/ "$MOUNT_DIR"/
+
+            mount_virtual_filesystems "$MOUNT_DIR"
 
             # 配置云初始化
             sudo truncate -s 0 "$MOUNT_DIR/etc/machine-id" || true
@@ -228,18 +237,29 @@ jobs:
             if sudo chroot "$MOUNT_DIR" /bin/bash -c "command -v grub-install >/dev/null 2>&1"; then
               if [ "$BOOT_MODE" = "bios-uefi" ]; then
                 sudo chroot "$MOUNT_DIR" /bin/bash -c \
-                  "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian --removable --recheck || true; \
-                   grub-install --target=i386-pc --recheck --boot-directory=/boot /dev/loop0 || true; \
-                   update-grub || true"
+                  "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian --removable --recheck; \
+                   grub-install --target=i386-pc --recheck --boot-directory=/boot $LOOP_DEV; \
+                   update-grub"
               else
                 sudo chroot "$MOUNT_DIR" /bin/bash -c \
-                  "grub-install --target=i386-pc --recheck --boot-directory=/boot /dev/loop0; \
-                   update-grub || true"
+                  "grub-install --target=i386-pc --recheck --boot-directory=/boot $LOOP_DEV; \
+                   update-grub"
               fi
             else
               echo "grub-install 不可用" >&2
               error_cleanup "$LOOP_DEV" "$MOUNT_DIR"
             fi
+
+            # --- 校验步骤开始 ---
+            echo ">>> 正在校验分区布局 (lsblk):"
+            lsblk "$LOOP_DEV"
+            echo ">>> 正在校验 BTRFS 子卷列表:"
+            sudo btrfs subvolume list "$MOUNT_DIR"
+            echo ">>> 正在校验挂载点状态:"
+            mount | grep "$MOUNT_DIR"
+            echo ">>> 正在检查 boot 目录内容:"
+            ls -R "$MOUNT_DIR/boot"
+            # --- 校验步骤结束 ---
 
             # 清理
             cleanup_all "$LOOP_DEV" "$MOUNT_DIR"

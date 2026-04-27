@@ -90,7 +90,10 @@ umount_efi_filesystem() {
 mount_virtual_filesystems() {
   local mount_dir="$1"
   for fs in proc sys dev run; do
-    sudo mount --bind "/$fs" "$mount_dir/$fs"
+    if ! mountpoint -q "$mount_dir/$fs"; then
+      sudo mkdir -p "$mount_dir/$fs"
+      sudo mount --bind "/$fs" "$mount_dir/$fs"
+    fi
   done
 }
 
