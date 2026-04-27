@@ -45,6 +45,7 @@ jobs:
             RELEASE=<< parameters.debian_release >>
             BOOT_MODE=<< parameters.boot_mode >>
             DEBOOT_DIR=/tmp/debootstrap-root
+            SETUP_SCRIPT_PATH="/tmp/system-setup.sh"
             sudo rm -rf "$DEBOOT_DIR"
             sudo mkdir -p "$DEBOOT_DIR"
             sudo debootstrap --arch=amd64 --variant=minbase "$RELEASE" "$DEBOOT_DIR" https://deb.debian.org/debian
@@ -56,7 +57,6 @@ jobs:
             EOF
             sudo chmod +x "$DEBOOT_DIR/usr/sbin/policy-rc.d"
 
-            # 根据 boot_mode 生成包列表
             if [ "$BOOT_MODE" = "bios-uefi" ]; then
               GRUB_PKGS="grub-efi-amd64 grub-efi-amd64-bin grub-pc-bin efibootmgr dosfstools"
               EXTRA_PKGS=""
@@ -65,45 +65,9 @@ jobs:
               EXTRA_PKGS=""
             fi
 
-            # 将包列表作为环境变量传入 chroot
-            sudo chroot "$DEBOOT_DIR" /bin/bash -c "export GRUB_PKGS='$GRUB_PKGS'; export EXTRA_PKGS='$EXTRA_PKGS'; $(cat \<<'CHROOT_SCRIPT'
-            set -euo pipefail
-            export DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none
-            
-            apt-get update
-            apt-get -y -o DPkg::Options::='--force-confdef' -o DPkg::Options::='--force-confold' install \
-              cloud-init openssh-server locales tzdata linux-image-cloud-amd64 initramfs-tools \
-              btrfs-progs btrfs-compsize unattended-upgrades dbus \
-              wget htop curl iproute2 net-tools ifupdown isc-dhcp-client python3-requests ca-certificates dialog perl-modules \
-              $GRUB_PKGS $EXTRA_PKGS
-
-            # 配置 locale
-            sed -i '/en_US.UTF-8 UTF-8/s/^# //g' /etc/locale.gen
-            locale-gen en_US.UTF-8
-            update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-
-            # 配置自动更新
-            cat > /etc/apt/apt.conf.d/20auto-upgrades \<<'APT_EOF'
-            APT::Periodic::Update-Package-Lists "1";
-            APT::Periodic::Unattended-Upgrade "1";
-            APT_EOF
-
-            sed -i 's/.*Unattended-Upgrade::Remove-Unused-Dependencies.*/Unattended-Upgrade::Remove-Unused-Dependencies "true";/' /etc/apt/apt.conf.d/50unattended-upgrades
-            sed -i 's/.*Unattended-Upgrade::Remove-Unused-Kernel-Packages.*/Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";/' /etc/apt/apt.conf.d/50unattended-upgrades
-            echo 'Unattended-Upgrade::Post-Invoke-Purge "true";' >> /etc/apt/apt.conf.d/50unattended-upgrades
-            passwd -d root
-
-            grep -q "^GRUB_TIMEOUT=" /etc/default/grub && sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' /etc/default/grub || echo 'GRUB_TIMEOUT=1' >> /etc/default/grub
-            grep -q "^GRUB_TIMEOUT_STYLE=" /etc/default/grub && sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub || echo 'GRUB_TIMEOUT_STYLE=menu' >> /etc/default/grub
-            sed -i '/GRUB_RECORDFAIL_TIMEOUT/d' /etc/default/grub; echo 'GRUB_RECORDFAIL_TIMEOUT=0' >> /etc/default/grub
-
-            rm -rf /usr/share/doc/* /var/cache/apt/* /var/lib/apt/lists/*
-            find /usr/share/locale/ -mindepth 1 -maxdepth 1 ! -name 'en*' -exec rm -rf {} +
-            cat /etc/passwd && cat /etc/shadow
-            rm -f /etc/ssh/ssh_host_*
-            apt-get -y autoremove && apt-get -y clean
-            CHROOT_SCRIPT
-            )"
+            sudo cp .circleci/scripts/system-setup.sh "$DEBOOT_DIR$SETUP_SCRIPT_PATH"
+            sudo chroot "$DEBOOT_DIR" /bin/bash -c "export GRUB_PKGS='$GRUB_PKGS'; export EXTRA_PKGS='$EXTRA_PKGS'; bash $SETUP_SCRIPT_PATH"
+            sudo rm -f "$DEBOOT_DIR$SETUP_SCRIPT_PATH"
 
             umount_virtual_filesystems "$DEBOOT_DIR"
 
