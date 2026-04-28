@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # 全局配置
-export BTRFS_MOUNT_OPTS="subvol=@,compress-force=zstd:9,discard=async,noatime"
+export BTRFS_MOUNT_OPTS="subvol=@,compress-force=zstd:9,discard=async,relatime,max_inline=3796,commit=60,space_cache=v2"
 export BTRFS_MKFS_OPTS="-f -M -n 4k"
 
 # 环境初始化
