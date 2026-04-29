@@ -32,12 +32,14 @@ grep -q "^GRUB_TIMEOUT=" /etc/default/grub && sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TI
 grep -q "^GRUB_TIMEOUT_STYLE=" /etc/default/grub && sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=menu/' /etc/default/grub || echo 'GRUB_TIMEOUT_STYLE=menu' >> /etc/default/grub
 sed -i '/GRUB_RECORDFAIL_TIMEOUT/d' /etc/default/grub; echo 'GRUB_RECORDFAIL_TIMEOUT=0' >> /etc/default/grub
 
+sed -i "s/^#[[:space:]]*\(umask\|export LS_OPTIONS\|eval\|alias ls\|alias ll\|alias l=\)/\1/" ~/.bashrc && source ~/.bashrc
 grep -q "^#*prepend domain-name-servers" /etc/dhcp/dhclient.conf && sed -i 's/^#*prepend domain-name-servers.*/prepend domain-name-servers 8.8.8.8, 1.1.1.1, 119.29.29.29, 223.5.5.5, 2001:4860:4860::8888;/' /etc/dhcp/dhclient.conf || echo "prepend domain-name-servers 8.8.8.8, 1.1.1.1, 119.29.29.29, 223.5.5.5, 2001:4860:4860::8888;" >> /etc/dhcp/dhclient.conf
 
 # 清理
-rm -rf /usr/share/doc/* /var/cache/apt/* /var/lib/apt/lists/*
+rm -rf /usr/share/doc/* /var/cache/apt/* /var/lib/apt/lists/* /usr/share/man /usr/share/info /usr/share/python-babel-localedata /usr/share/i18n /usr/share/groff /usr/share/X11
 find /usr/share/locale/ -mindepth 1 -maxdepth 1 ! -name 'en*' -exec rm -rf {} +
 cat /etc/passwd && cat /etc/shadow
-rm -f /etc/ssh/ssh_host_*
+rm -f /etc/ssh/ssh_host_* ~/.bash_history ~/.ssh/authorized_keys
 apt-get -y autoremove && apt-get -y clean
+apt-get -y purge $(dpkg -l | grep '^rc' | awk '{print $2}')
 

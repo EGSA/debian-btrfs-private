@@ -143,6 +143,8 @@ jobs:
 
             # 配置云初始化
             sudo truncate -s 0 "$MOUNT_DIR/etc/machine-id" || true
+            sudo rm -f "$MOUNT_DIR/var/lib/dbus/machine-id" || true
+            sudo rm -f "$MOUNT_DIR/var/lib/systemd/random-seed" || true
             sudo bash .circleci/scripts/apply-configs.sh "$MOUNT_DIR"
             sudo chroot "$MOUNT_DIR" /bin/bash -c "cloud-init clean --logs --seed" || true
 
