@@ -15,6 +15,7 @@ preserve_hostname: false
 package_update: true
 package_upgrade: false
 timezone: Asia/Shanghai
+users: []
 
 packages:
   - btrfs-compsize
@@ -23,7 +24,13 @@ packages:
   - htop
   - curl
   - dialog
-  - perl-modules
+  - perl
+  - rsync
+  - lsof
+  - tree
+  - vim
+  - screen
+  - btop
 
 write_files:
   - path: /etc/ssh/sshd_config.d/99-custom.conf
@@ -33,10 +40,28 @@ write_files:
       PermitRootLogin prohibit-password
       PasswordAuthentication no
       PubkeyAuthentication yes
+  - path: /etc/resolv.conf
+    owner: root:root
+    permissions: '0444'
+    content: |
+      options timeout:1 attempts:1
+      nameserver 8.8.8.8
+      nameserver 1.1.1.1
+      nameserver 119.29.29.29
+      nameserver 223.5.5.5
+      nameserver 2001:4860:4860::8888
+  - path: /etc/systemd/timesyncd.conf.d/99-custom.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Time]
+      NTP=ntp.aliyun.com ntp.tencent.com time.cloudflare.com pool.ntp.org
+      FallbackNTP=ntp.ubuntu.com time.nist.gov
+
 runcmd:
   - systemctl restart sshd
+  - chattr +i /etc/resolv.conf
+  - systemctl restart systemd-timesyncd
 
-system_info:
-  default_user: null
 EOF
 
