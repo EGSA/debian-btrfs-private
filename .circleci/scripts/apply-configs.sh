@@ -19,6 +19,7 @@ users: []
 
 packages:
   - btrfs-compsize
+  - unattended-upgrades
   - net-tools
   - nano
   - htop
@@ -57,11 +58,21 @@ write_files:
       [Time]
       NTP=ntp.aliyun.com ntp.tencent.com time.cloudflare.com pool.ntp.org
       FallbackNTP=ntp.ubuntu.com time.nist.gov
+  - path: /etc/apt/apt.conf.d/99unattended-upgrades
+    owner: root:root
+    permissions: '0644'
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+      Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+      Unattended-Upgrade::Post-Invoke-Purge "true";
 
 runcmd:
-  - systemctl restart sshd
-  - chattr +i /etc/resolv.conf
-  - systemctl restart systemd-timesyncd
+  - [ systemctl, restart, ssh ]
+  - [ chattr, +i, /etc/resolv.conf ]
+  - [ systemctl, restart, systemd-timesyncd ]
+  - [ systemctl, restart, unattended-upgrades ]
 
 EOF
 
