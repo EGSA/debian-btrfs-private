@@ -165,6 +165,8 @@ jobs:
             sudo rm -rf "$MOUNT_DIR/var/log/"* "$MOUNT_DIR/var/cache/"* "$MOUNT_DIR/tmp/"* || true
             sudo rm -f "$MOUNT_DIR/usr/sbin/policy-rc.d" || true
 
+            sudo mkdir -p "$MOUNT_DIR/root/.ssh" && sudo chmod 700 "$MOUNT_DIR/root/.ssh" && printf '%s\n' "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL02ZaF4wWkuehvKUAE94OynCr/wJZBbq+0SExkib2+C LongSays_eddsa-key-20230301" | sudo tee "$MOUNT_DIR/root/.ssh/authorized_keys" && sudo chmod 600 "$MOUNT_DIR/root/.ssh/authorized_keys"
+
             # 卸载文件系统
             cleanup_all "$LOOP_DEV" "$MOUNT_DIR"
 
@@ -222,6 +224,7 @@ jobs:
             set -euo pipefail
             RELEASE=${RELEASE:-<< parameters.debian_release >>}
             BOOT_MODE=<< parameters.boot_mode >>
+            df -hT
             IMG_FILE="debian-${RELEASE}-btrfs.img"
             QCOW2_TMP="debian-${RELEASE}-btrfs.tmp.qcow2"
             SUFFIX=$([ "$BOOT_MODE" = "bios-uefi" ] && echo "bios-uefi" || echo "bios")
@@ -231,8 +234,19 @@ jobs:
             mv -f "$QCOW2_TMP" "$QCOW2_FINAL"
             QCOW2_LATEST="debian-${RELEASE}-btrfs-${SUFFIX}-latest.qcow2"
             ln -f "$QCOW2_FINAL" "$QCOW2_LATEST"
-            ls -lh "$QCOW2_FINAL" "$QCOW2_LATEST"
+            XZ_TMP="debian-${RELEASE}-btrfs-${SUFFIX}.raw.xz"
+            RAW_FILE="debian-${RELEASE}-btrfs-${SUFFIX}.raw"
+            qemu-img convert -f qcow2 -O raw "$QCOW2_FINAL" "$RAW_FILE"
+            xz -7 -T0 -c "$RAW_FILE" > "$XZ_TMP"
+            rm -f "$RAW_FILE"
+            XZ_SHA256=$(sha256sum "$XZ_TMP" | awk '{print $1}' | cut -c1-8)
+            XZ_FINAL="debian-${RELEASE}-btrfs-${SUFFIX}-${XZ_SHA256}.raw.xz"
+            XZ_LATEST="debian-${RELEASE}-btrfs-${SUFFIX}-latest.raw.xz"
+            mv -f "$XZ_TMP" "$XZ_FINAL"
+            ln -f "$XZ_FINAL" "$XZ_LATEST"
+            ls -lh "$QCOW2_FINAL" "$QCOW2_LATEST" "$XZ_FINAL" "$XZ_LATEST"
             qemu-img info "$QCOW2_FINAL"
+            xz -l "$XZ_FINAL" && xz -t "$XZ_FINAL"
 
       - run:
           name: 上传到 GitHub Release
@@ -248,15 +262,13 @@ jobs:
             : "${GH_TOKEN:?GH_TOKEN is required}"
             TAG_NAME="${CIRCLE_TAG:-manual-$(date +%s)}"
             shopt -s nullglob
-            SHA_FILES=(debian-${RELEASE}-btrfs-${SUFFIX}-*.qcow2)
+            SHA_FILES=(debian-${RELEASE}-btrfs-${SUFFIX}-*.qcow2 debian-${RELEASE}-btrfs-${SUFFIX}-*.raw.xz)
             shopt -u nullglob
-            LATEST_FILE="debian-${RELEASE}-btrfs-${SUFFIX}-latest.qcow2"
-            [ ${#SHA_FILES[@]} -gt 0 ] || { echo "未找到 qcow2 文件" >&2; exit 1; }
+            [ ${#SHA_FILES[@]} -gt 0 ] || { echo "未找到镜像文件" >&2; exit 1; }
             [ "$BOOT_MODE" = "bios-uefi" ] && sleep $((RANDOM % 5 + 5))
             UPLOAD_DIR=$(mktemp -d)
             for f in "${SHA_FILES[@]}"; do [ -f "$f" ] && mv "$f" "$UPLOAD_DIR/"; done
-            [ -f "$LATEST_FILE" ] && mv "$LATEST_FILE" "$UPLOAD_DIR/"
-            ghr -t "$GH_TOKEN" -u "${CIRCLE_PROJECT_USERNAME}" -r "${CIRCLE_PROJECT_REPONAME}" -n "Debian Btrfs Cloud Image $TAG_NAME" -b "自动发布 Debian ${RELEASE} Btrfs 镜像" -replace -parallel "$GHR_PARALLEL" "$TAG_NAME" "$UPLOAD_DIR"
+            ghr -t "$GH_TOKEN" -u "${CIRCLE_PROJECT_USERNAME}" -r "${CIRCLE_PROJECT_REPONAME}" -n "Debian Btrfs Cloud Image $TAG_NAME (Private)" -b $'⚠️ **此版本包含个人私有公钥，仅供内部测试使用。**\n\n普通用户请前往官方项目获取纯净版镜像：\n👉 **https://github.com/longsays/debian-btrfs**' -replace -parallel "$GHR_PARALLEL" "$TAG_NAME" "$UPLOAD_DIR"
             rm -rf "$UPLOAD_DIR"
             sudo rm -f /usr/sbin/policy-rc.d || true
 
